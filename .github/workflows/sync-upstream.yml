@@ -1,0 +1,97 @@
+# 自动跟随上游 Sui-IB/InternalBeyond-Mobile 同步
+# 本仓库 huochenxibaodongsheng-cyber/dbs.github.io 是它的 GitHub Pages 镜像。
+#
+# 行为：
+#   • 每小时检查一次上游 main；也可在 Actions 页面点 "Run workflow" 手动触发
+#   • 用上游内容覆盖本仓库对应文件，并删除上游已移除的文件
+#   • .github/ 目录（含本 workflow 自身）属于本仓库自有内容，永不覆盖、永不删除
+#   • 只有真的发生变化时才产生一次提交；没有更新就静默结束，不留空提交
+#
+# 想保留自己的改动：把该路径加进下面 KEEP_RE 正则（ERE），例如 (^|/)my-notes\.md$
+# 想暂停同步：Actions → Sync upstream → 右上角 "..." → Disable workflow
+
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Sui-IB/InternalBeyond-Mobile
+  UPSTREAM_BRANCH: main
+  KEEP_RE: '^(\.github/)'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags --depth=1 upstream "${UPSTREAM_BRANCH}"
+
+      - name: Mirror upstream files
+        run: |
+          set -euo pipefail
+          UP_REF="upstream/${UPSTREAM_BRANCH}"
+
+          git ls-tree -r --name-only "${UP_REF}" | grep -Ev "${KEEP_RE}" | sort > /tmp/upstream.txt || true
+          git ls-files | grep -Ev "${KEEP_RE}" | sort > /tmp/mine.txt || true
+
+          # 1) 上游已移除、而本仓库还留着的文件 —— 一并删除
+          comm -23 /tmp/mine.txt /tmp/upstream.txt > /tmp/gone.txt
+          if [ -s /tmp/gone.txt ]; then
+            echo "::group::上游已移除，本仓库同步删除"
+            cat /tmp/gone.txt
+            echo "::endgroup::"
+            xargs -r -d '\n' -a /tmp/gone.txt git rm -q --ignore-unmatch --
+          fi
+
+          # 2) 用上游内容覆盖本仓库（KEEP_RE 命中的路径除外）
+          xargs -r -d '\n' -a /tmp/upstream.txt git checkout "${UP_REF}" --
+
+      - name: Commit and push if changed
+        run: |
+          set -euo pipefail
+          UP_REF="upstream/${UPSTREAM_BRANCH}"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "已是最新：${UPSTREAM_REPO}@${UPSTREAM_BRANCH} 没有新内容"
+            exit 0
+          fi
+
+          UP_SHA=$(git rev-parse --short "${UP_REF}")
+          UP_SUBJECT=$(git log -1 --format=%s "${UP_REF}")
+          NEW_VER=$(grep -oE "IB_VER='[^']+'" index.html | head -1 | cut -d"'" -f2 || true)
+
+          echo "::group::本次同步变更"
+          git diff --cached --stat
+          echo "::endgroup::"
+
+          git commit -q \
+            -m "自动同步上游 ${UP_SHA}：${UP_SUBJECT}" \
+            -m "上游仓库：${UPSTREAM_REPO}@${UPSTREAM_BRANCH}（${UP_SHA}）" \
+            -m "页面版本：${NEW_VER:-未知}"
+
+          git push origin "HEAD:${GITHUB_REF_NAME:-main}"
